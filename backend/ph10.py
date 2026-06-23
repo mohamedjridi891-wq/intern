@@ -588,6 +588,7 @@ async def lifespan(app: FastAPI):
             f"ph4.search is unavailable ({_qdrant_import_error}) — "
             f"file search will return no results until this is fixed."
         )
+    yield  # <-- add this
 
 
 app = FastAPI(

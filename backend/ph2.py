@@ -703,7 +703,11 @@ def _safe_str(value) -> str:
 
 def _process_single_row(args):
     loop_i, row = args
-
+    try:
+            import pythoncom
+            pythoncom.CoInitialize()
+    except Exception:
+            pass
     path = str(row.get("path", ""))
     extension = str(row.get("extension", "")).lower()
     category = str(row.get("category", ""))
