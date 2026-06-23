@@ -21,7 +21,6 @@ These files and folders are typically generated outputs or local environment fil
 - `phase7_model.joblib`
 - `phase7_report.json`
 - `phase9_report.json`
-- `vector_store.faiss`
 - `embedding_errors.log`
 - `phase9_errors.log`
 - `extraction_errors.log`
@@ -31,6 +30,8 @@ These files and folders are typically generated outputs or local environment fil
 - `.venv/`
 - `review/`
 - `root/`
+- `llm_cache.json`
+- `phase11_report.json`
 
 If you keep the frontend source but want a clean workspace, you can also delete:
 

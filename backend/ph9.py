@@ -42,7 +42,14 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from dotenv import load_dotenv
+def _get_markitdown():
+    try:
+        from markitdown import MarkItDown
+        return MarkItDown()
+    except ImportError:
+        return None
 
+_markitdown_ph9 = _get_markitdown()
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -353,7 +360,24 @@ Return ONLY a JSON object in this exact format (no markdown, no extra text):
   "explanation": "2-3 sentence explanation here.",
   "tip": "One concrete actionable tip here."
 }"""
-
+def _clean_snippet_for_llm(text: str) -> str:
+    """Use MarkItDown to normalize a text snippet before LLM injection."""
+    if not _markitdown_ph9 or not text or len(text) < 30:
+        return text
+    try:
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False,
+            encoding="utf-8", errors="replace"
+        ) as tmp:
+            tmp.write(text)
+            tmp_path = tmp.name
+        result = _markitdown_ph9.convert(tmp_path)
+        converted = result.text_content if hasattr(result, "text_content") else str(result)
+        os.unlink(tmp_path)
+        return converted.strip() if converted and len(converted) > 10 else text
+    except Exception:
+        return text
 
 def _build_llm_prompt(row: dict, top3: list, weak_signals: list) -> str:
     top_text = "\n".join(
@@ -364,8 +388,11 @@ def _build_llm_prompt(row: dict, top3: list, weak_signals: list) -> str:
         f"  - {s['label']}: {s['value']:.2f} (low impact: {s['shap']:.3f})"
         for s in weak_signals
     )
+    # ADD: clean the file name/path context with markitdown if available
+    file_name = _clean_snippet_for_llm(row.get("name", "unknown"))
+    
     return (
-        f"File: {row.get('name', 'unknown')}\n"
+        f"File: {file_name}\n"
         f"Type: {row.get('ext', 'unknown')}\n"
         f"Score: {row.get('importance_score', 0):.1f}/100\n"
         f"Decision: {row.get('label', 'REVIEW')}\n"

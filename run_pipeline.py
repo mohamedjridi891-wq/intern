@@ -27,7 +27,7 @@ def run_phases():
         result = run_pipeline(root_folder)
         log.info("Starting backend and frontend now...")
         log.info("")
-        start_backend_and_frontend(os.path.join(os.path.dirname(__file__), 'backend'))
+        start_backend_and_frontend(os.path.dirname(__file__))
         return result
     except Exception as e:
         log.error(f"Pipeline failed: {e}", exc_info=True)
@@ -50,7 +50,7 @@ def run_pipeline(root_folder: str | None = None) -> dict:
     log.info("=" * 70)
     log.info("")
 
-    backend_dir = os.path.join(os.path.dirname(__file__), 'backend')
+    backend_dir = os.path.dirname(__file__)
     phases = [
         ('ph1.py', 'Indexing files from root folder'),
         ('ph2.py', 'Extracting content from files'),

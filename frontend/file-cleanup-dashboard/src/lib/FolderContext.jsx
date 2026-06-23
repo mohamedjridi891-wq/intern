@@ -6,22 +6,12 @@ export function FolderProvider({ children }) {
   const [selectedFolder, setSelectedFolder] = useState('')
   const [folderHistory, setFolderHistory] = useState([])
 
-  // Load from localStorage on mount
-  useEffect(() => {
-    const saved = localStorage.getItem('selectedFolder')
-    if (saved) {
-      setSelectedFolder(saved)
-    }
-  }, [])
-
-  // Save to localStorage when changes
+  // Track history in memory whenever folder changes
   useEffect(() => {
     if (selectedFolder) {
-      localStorage.setItem('selectedFolder', selectedFolder)
-      // Add to history if not already there
       setFolderHistory(prev => {
         if (!prev.includes(selectedFolder)) {
-          return [selectedFolder, ...prev].slice(0, 10) // Keep last 10
+          return [selectedFolder, ...prev].slice(0, 10)
         }
         return prev
       })

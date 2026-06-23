@@ -9,7 +9,7 @@ import FileDetailDrawer from '../components/FileDetailDrawer'
 import ConfirmModal from '../components/ConfirmModal'
 import { EmptyState } from '../components/Shared'
 import { formatSize, formatDate } from '../lib/format'
-import { fetchFiles } from '../lib/api'
+import { fetchFiles, performFileAction} from '../lib/api'
 
 function buildTree(files) {
   const root = {}
@@ -120,6 +120,14 @@ export default function FileExplorer() {
 
   function toggleSelectAll() {
     setSelected(prev => prev.size === filtered.length ? new Set() : new Set(filtered.map(f => f.file_id)))
+  }
+  async function handleDrawerAction(action, file) {
+    try {
+      await performFileAction(file.file_id, action)
+    } catch (err) {
+      console.error('Failed to perform action:', err)
+    }
+    setDrawerFile(null)
   }
 
   return (
@@ -237,7 +245,11 @@ export default function FileExplorer() {
         </div>
       </div>
 
-      <FileDetailDrawer file={drawerFile} onClose={() => setDrawerFile(null)} onAction={() => setDrawerFile(null)} />
+       <FileDetailDrawer
+        file={drawerFile}
+        onClose={() => setDrawerFile(null)}
+        onAction={handleDrawerAction}
+      />
 
       <ConfirmModal
         open={!!confirm}

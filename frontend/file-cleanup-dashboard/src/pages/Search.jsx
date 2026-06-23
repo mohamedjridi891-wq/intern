@@ -1,5 +1,5 @@
-import { useMemo, useState, useEffect } from 'react'
-import { Search as SearchIcon, Sparkles, ArrowUpDown, Lightbulb } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Search as SearchIcon, Sparkles, ArrowUpDown, Lightbulb, AlertTriangle } from 'lucide-react'
 import FileIcon from '../components/FileIcon'
 import StatusBadge from '../components/StatusBadge'
 import ScorePill from '../components/ScorePill'
@@ -7,7 +7,7 @@ import WhyExplain from '../components/WhyExplain'
 import FileDetailDrawer from '../components/FileDetailDrawer'
 import { EmptyState } from '../components/Shared'
 import { formatSize, formatDate } from '../lib/format'
-import { fetchFiles } from '../lib/api'
+import { searchFiles } from '../lib/api'
 
 const SUGGESTIONS = [
   'Find old files no one has opened in 2 years',
@@ -16,51 +16,48 @@ const SUGGESTIONS = [
   'Large video files in marketing',
 ]
 
-const SNIPPET_BANK = [
-  "Mentions quarterly figures and a budget breakdown that closely matches your query.",
-  "Contains contract language and signature fields relevant to your search.",
-  "This file's content focuses on the same project name you searched for.",
-  "Includes a list of action items and dates close to the period you asked about.",
-  "Looks like an early draft — wording overlaps heavily with your query terms.",
-]
-
 export default function Search() {
   const [query, setQuery] = useState('')
   const [submitted, setSubmitted] = useState('')
   const [sortMode, setSortMode] = useState('relevance')
   const [drawerFile, setDrawerFile] = useState(null)
-  const [files, setFiles] = useState([])
+  const [results, setResults] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
 
-  // Load files on mount
+  // Run the real backend search whenever a query is submitted
   useEffect(() => {
-    async function load() {
+    if (!submitted) {
+      setResults([])
+      setError('')
+      return
+    }
+
+    let cancelled = false
+    async function run() {
+      setLoading(true)
+      setError('')
       try {
-        const data = await fetchFiles(5000)
-        setFiles(data || [])
+        const data = await searchFiles(submitted, 30)
+        if (!cancelled) setResults(data || [])
       } catch (err) {
-        console.error('Failed to load files:', err)
-        setFiles([])
+        if (!cancelled) {
+          setError('Search is unavailable right now. Please try again in a moment.')
+          setResults([])
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
       }
     }
-    load()
-  }, [])
+    run()
+    return () => { cancelled = true }
+  }, [submitted])
 
-  const results = useMemo(() => {
-    if (!submitted) return []
-    const filesList = files
-    
-    // Semantic ranking: pseudo-random but stable per query string
-    const seed = submitted.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
-    return filesList
-      .map((f, i) => ({ 
-        ...f, 
-        relevance: ((seed * (i + 1)) % 97) / 100, 
-        snippet: SNIPPET_BANK[(seed + i) % SNIPPET_BANK.length] 
-      }))
-      .filter(f => f.relevance > 0.55)
-      .sort((a, b) => sortMode === 'relevance' ? b.relevance - a.relevance : (b.importance_score || 0) - (a.importance_score || 0))
-      .slice(0, 9)
-  }, [submitted, sortMode, files])
+  const sortedResults = [...results].sort((a, b) =>
+    sortMode === 'relevance'
+      ? (b.relevance || 0) - (a.relevance || 0)
+      : (b.importance_score || 0) - (a.importance_score || 0)
+  )
 
   return (
     <div className="space-y-5">
@@ -99,7 +96,11 @@ export default function Search() {
 
       {submitted && (
         <div className="flex items-center justify-between">
-          <p className="text-sm text-slate-500 dark:text-slate-400">{results.length} result{results.length !== 1 ? 's' : ''} for "{submitted}"</p>
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            {loading
+              ? 'Searching…'
+              : `${sortedResults.length} result${sortedResults.length !== 1 ? 's' : ''} for "${submitted}"`}
+          </p>
           <button
             onClick={() => setSortMode(m => m === 'relevance' ? 'importance' : 'relevance')}
             className="focus-ring inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
@@ -117,7 +118,15 @@ export default function Search() {
         />
       )}
 
-      {submitted && results.length === 0 && (
+      {submitted && !loading && error && (
+        <EmptyState
+          icon={AlertTriangle}
+          title="Search unavailable"
+          description={error}
+        />
+      )}
+
+      {submitted && !loading && !error && sortedResults.length === 0 && (
         <EmptyState
           icon={SearchIcon}
           title="No matches found"
@@ -126,7 +135,7 @@ export default function Search() {
       )}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {results.map(f => (
+        {sortedResults.map(f => (
           <div
             key={f.file_id}
             onClick={() => setDrawerFile(f)}
@@ -141,13 +150,15 @@ export default function Search() {
                 <p className="truncate font-mono text-[11px] text-slate-400">{f.folder}</p>
               </div>
               <span className="shrink-0 rounded-full bg-brand-50 px-2 py-0.5 text-[11px] font-semibold text-brand-700 dark:bg-brand-900/30 dark:text-brand-300">
-                {Math.round(f.relevance * 100)}% match
+                {Math.round((f.relevance || 0) * 100)}% match
               </span>
             </div>
-            <p className="mt-2.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">{f.snippet}</p>
+            <p className="mt-2.5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+              {f.snippet || 'No text preview available for this file.'}
+            </p>
             <div className="mt-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <ScorePill score={f.importance_score} width={48} />
+                <ScorePill score={f.importance_score || 0} width={48} />
                 <WhyExplain file={f} />
               </div>
               <StatusBadge label={f.label} />

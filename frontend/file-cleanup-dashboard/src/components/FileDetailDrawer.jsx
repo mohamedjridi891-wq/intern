@@ -5,22 +5,39 @@ import { formatSize, formatDate } from '../lib/format'
 
 function explainFile(file) {
   const score = Number(file.importance_score) || 0
-  const signals = file.signals || {}
-  const top3 = Object.entries(signals)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([key, value]) => ({
-      label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-      value,
-    }))
+  const label = file.label || 'REVIEW'
 
-  const text = `This file has a score of ${score} and is marked ${file.label || 'REVIEW'}. The most influential signals are ${top3.map(item => item.label).join(', ')}.`
-  return {
-    text,
-    top3,
-    tip: 'Review the top signals above to understand why this file was highlighted.',
-    confidence: Math.min(1, Math.max(0.05, score / 100)),
+  const structuredTop3 = [
+    { signal: 'top_signal_1', label: file.top_signal_1, value: file.top_signal_1_value },
+    { signal: 'top_signal_2', label: file.top_signal_2, value: file.top_signal_2_value },
+    { signal: 'top_signal_3', label: file.top_signal_3, value: file.top_signal_3_value },
+  ].filter(s => s.label && s.value != null)
+
+  let top3
+  if (structuredTop3.length > 0) {
+    top3 = structuredTop3
+  } else {
+    const signals = file.signals || {}
+    top3 = Object.entries(signals)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([key, value]) => ({
+        signal: key,
+        label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+        value: Math.min(1, value),
+      }))
   }
+
+  const text = file.explanation_text
+    || `This file has a score of ${score} and is marked ${label}. The most influential signals are ${top3.map(item => item.label).join(', ')}.`
+  const tip = file.counterfactual_tip
+    || 'Review the top signals above to understand why this file was highlighted.'
+
+  const confidence = file.confidence != null
+    ? Number(file.confidence)
+    : Math.min(1, Math.max(0.05, score / 100))
+
+  return { text, top3, tip, confidence }
 }
 
 export default function FileDetailDrawer({ file, onClose, onAction }) {

@@ -2,14 +2,14 @@
 Phase 6 — Duplicate & Redundancy Detection
 
 Reads from : chunks table          (ph1 → ph3)
-             find_duplicate_chunks  (py4_5 — FAISS-based near-dup scan)
+             find_duplicate_chunks  (py4 — Qdrant-based near-dup scan)
 Writes to  : duplicate_files, redundant_sections,
              file_redundancy, merge_recommendations  (PostgreSQL)
              phase6_report.json
 
 Steps:
   1. Exact duplicates  — hash match on chunks.hash (set by ph1)
-  2. Near-duplicates   — import find_duplicate_chunks() from py4_5 (FAISS)
+  2. Near-duplicates   — import find_duplicate_chunks() from py4
   3. File-level groups — aggregate chunk pairs → file pairs
   4. Recommendations   — action + severity per pair
   5. JSON report
@@ -24,7 +24,7 @@ import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from dotenv import load_dotenv
 
-from ph4 import find_duplicate_chunks   # ← ph4/5 FAISS scan
+from ph4 import find_duplicate_chunks   
 
 load_dotenv()
 
@@ -52,10 +52,10 @@ def _conn():
 def _create_tables(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS duplicate_files;
-            DROP TABLE IF EXISTS redundant_sections;
-            DROP TABLE IF EXISTS file_redundancy;
             DROP TABLE IF EXISTS merge_recommendations;
+            DROP TABLE IF EXISTS redundant_sections;
+            DROP TABLE IF EXISTS duplicate_files;
+            DROP TABLE IF EXISTS file_redundancy;
             
             CREATE TABLE duplicate_files (
                 hash        TEXT,
@@ -143,9 +143,9 @@ def _exact_duplicates(conn) -> pd.DataFrame:
 # ── Step 2 — Near-duplicates (imported from py4_5) ────────────────────────────
 
 def _near_duplicates(conn) -> pd.DataFrame:
-    print(f"\n[2] Near-duplicate chunks (FAISS, threshold={SIMILARITY_THRESHOLD})...")
+    print(f"\n[2] Near-duplicate chunks (Qdrant, threshold={SIMILARITY_THRESHOLD})...")
 
-    # find_duplicate_chunks() does the FAISS scan — no logic duplicated here
+    
     dup_df = find_duplicate_chunks(similarity_threshold=SIMILARITY_THRESHOLD, store=False)
     if dup_df.empty:
         print("  → 0 near-duplicate pair(s)")
@@ -242,7 +242,7 @@ def _recommendations(conn, exact_df: pd.DataFrame, file_df: pd.DataFrame) -> lis
             "rec_type": "exact_duplicate", "severity": "HIGH",
             "primary_id": r.path_1, "duplicate_id": r.path_2,
             "action": "Delete one copy",
-            "details": f"Identical files (hash={r.hash[:12]}…)",
+            "details": f"Identical files (hash={r.hash[:12] if r.hash else 'unknown'}…)",
         })
 
     for r in file_df.itertuples():

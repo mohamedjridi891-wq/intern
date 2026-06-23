@@ -44,6 +44,7 @@ Run:
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import uuid
@@ -58,7 +59,34 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field
+def _get_markitdown():
+    try:
+        from markitdown import MarkItDown
+        return MarkItDown()
+    except ImportError:
+        return None
 
+_markitdown_ph10 = _get_markitdown()
+
+
+def _clean_context_text(text: str) -> str:
+    """Normalize a file context snippet with MarkItDown before LLM injection."""
+    if not _markitdown_ph10 or not text or len(text) < 30:
+        return text
+    try:
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False,
+            encoding="utf-8", errors="replace"
+        ) as tmp:
+            tmp.write(text)
+            tmp_path = tmp.name
+        result = _markitdown_ph10.convert(tmp_path)
+        converted = result.text_content if hasattr(result, "text_content") else str(result)
+        os.unlink(tmp_path)
+        return converted.strip() if converted and len(converted) > 10 else text
+    except Exception:
+        return text
 load_dotenv()
 
 # Ensure stdout/stderr use UTF-8 on Windows consoles to avoid UnicodeEncodeError
@@ -155,26 +183,35 @@ Rules:
 - Keep answers short: 2-4 sentences unless asked for more detail.
 - Refer to files by name, not by ID."""
 
-# Lazy import: ph4 pulls in hf_config, sentence-transformers, faiss, etc.
+# Lazy import: ph4 pulls in hf_config, sentence-transformers, qdrant, etc.
 # Importing it lazily means /health and / still work even if that chain
 # is broken, and we get a clear error at call time instead of at startup.
-_faiss_search = None
-_faiss_import_error = None
+_qdrant_search = None
+_qdrant_import_error = None
 
 
-def _get_faiss_search():
-    global _faiss_search, _faiss_import_error
-    if _faiss_search is None and _faiss_import_error is None:
+def _get_qdrant_search():
+    global _qdrant_search, _qdrant_import_error
+    if _qdrant_search is None and _qdrant_import_error is None:
         try:
-            from ph4 import search as faiss_search
-            _faiss_search = faiss_search
+            from ph4 import search as qdrant_search
+            _qdrant_search = qdrant_search
         except Exception as e:
-            _faiss_import_error = e
+            _qdrant_import_error = e
             log.error(f"Could not import ph4.search: {e}")
-    return _faiss_search
+    return _qdrant_search
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
-
+def _icon_for_category(category: str) -> str:
+    return {
+        "Document":     "FileText",
+        "Spreadsheet":  "Sheet",
+        "Presentation": "Presentation",
+        "Image":        "Image",
+        "Archive":      "Archive",
+        "Code":         "Code2",
+        "Video":        "Video",
+    }.get(category or "", "FileWarning")
 def _require_db_url():
     if not DB_URL:
         raise RuntimeError(
@@ -356,17 +393,17 @@ def load_history(conn, session_id, limit=20):
 
 # ── Retrieval + scoring ───────────────────────────────────────────────────────
 
-def get_relevant_files(message: str):
-    """Search FAISS index, then attach score + label from ph7. Returns a list of dicts."""
-    faiss_search = _get_faiss_search()
-    if faiss_search is None:
-        log.warning(f"FAISS search unavailable: {_faiss_import_error}")
+def get_relevant_files(message: str, top_k: int = None):
+    """Search Qdrant index, then attach score + label from ph7. Returns a list of dicts."""
+    qdrant_search = _get_qdrant_search()
+    if qdrant_search is None:
+        log.warning(f"Qdrant search unavailable: {_qdrant_import_error}")
         return []
 
     try:
-        df = faiss_search(message, top_k=TOP_K)
+        df = qdrant_search(message, top_k=top_k or TOP_K)
     except Exception as e:
-        log.warning(f"FAISS search failed: {e}")
+        log.warning(f"Qdrant search failed: {e}")
         return []
 
     if df is None or df.empty:
@@ -394,6 +431,9 @@ def get_relevant_files(message: str):
             continue
         seen.add(fid)
         s = scores.get(fid, {})
+        snippet = str(row.get("clean_text", "") or "").strip()
+        if len(snippet) > 240:
+            snippet = snippet[:240].rsplit(" ", 1)[0] + "…"
         files.append({
             "file_id": fid,
             "name": row.get("name", ""),
@@ -402,6 +442,9 @@ def get_relevant_files(message: str):
             "relevance": round(float(row.get("score", 0.0)), 3),
             "importance_score": s.get("importance_score"),
             "label": s.get("label"),
+            "snippet": snippet,
+            # ADD: fetch and clean a short text preview for Groq context
+            "preview": "",   # populated below
         })
     return files
 
@@ -457,8 +500,26 @@ def ask_groq(history: list[dict], message: str, files: list[dict]) -> str:
         raise HTTPException(503, "Chat is not configured: GROQ_API_KEY is missing.")
 
     if files:
+        fids = [f["file_id"] for f in files]
+        try:
+            with db_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """SELECT DISTINCT ON (file_id) file_id, clean_text
+                        FROM chunks
+                        WHERE file_id = ANY(%s) AND clean_status = 'SUCCESS'
+                        ORDER BY file_id, chunk_index ASC""",
+                        (fids,)
+                    )
+                    previews = {row["file_id"]: row["clean_text"] for row in cur.fetchall()}
+            for f in files:
+                raw_preview = previews.get(f["file_id"], "")
+                f["preview"] = _clean_context_text(raw_preview[:1000]) if raw_preview else ""
+        except Exception as e:
+            log.warning(f"Could not fetch chunk previews: {e}")
         context = "\n".join(
             f"- {f['name']} | label={f['label']} | score={f['importance_score']}"
+            + (f"\n  Preview: {f['preview'][:200]}" if f.get('preview') else "")
             for f in files
         )
     else:
@@ -521,12 +582,11 @@ async def lifespan(app: FastAPI):
     init_db()
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY is not set — /chat will return 503 until it is configured.")
-    if _get_faiss_search() is None:
+    if _get_qdrant_search() is None:
         log.warning(
-            f"ph4.search is unavailable ({_faiss_import_error}) — "
+            f"ph4.search is unavailable ({_qdrant_import_error}) — "
             f"file search will return no results until this is fixed."
         )
-    yield
 
 
 app = FastAPI(
@@ -566,7 +626,7 @@ def health():
         "advisory_notice": ADVISORY_NOTICE,
         "can_modify_files": False,
         "groq_configured": bool(GROQ_API_KEY),
-        "faiss_search_available": _get_faiss_search() is not None,
+        "qdrant_search_available": _get_qdrant_search() is not None,
     }
 
 
@@ -590,9 +650,21 @@ def _explanations_join_sql(conn) -> tuple[str, str]:
     The frontend (WhyExplain.jsx / FileDetailDrawer.jsx) reads a flat
     {signal_name: value} object as `file.signals` and `file.confidence`; the
     shap_json column is exactly that shape, so we expose it directly.
+
+    Also exposes the actual ph9-generated explanation_text and
+    counterfactual_tip, plus the top-3 signals as a ready-to-render list
+    (signal name, its real 0-1 value, and its SHAP magnitude separately) —
+    so the UI can show real plain-language reasoning instead of
+    re-deriving its own from importance_score alone.
     """
     if _table_exists(conn, 'file_explanations'):
-        select_extra = ", fe.confidence, fe.shap_json AS signals"
+        select_extra = (
+            ", fe.confidence, fe.shap_json AS signals"
+            ", fe.explanation_text, fe.counterfactual_tip"
+            ", fe.top_signal_1, fe.top_signal_1_value, fe.top_signal_1_shap"
+            ", fe.top_signal_2, fe.top_signal_2_value, fe.top_signal_2_shap"
+            ", fe.top_signal_3, fe.top_signal_3_value, fe.top_signal_3_shap"
+        )
         join_clause = " LEFT JOIN file_explanations fe ON f.id = fe.file_id"
         return select_extra, join_clause
     return "", ""
@@ -605,18 +677,46 @@ def list_files(limit: int = 100):
             if not _table_exists(conn, 'files'):
                 return []
             sel, join = _explanations_join_sql(conn)
+
+            # Join extracted_content for extraction_status
+            ec_join = ""
+            ec_sel = ""
+            if _table_exists(conn, 'extracted_content'):
+                ec_join = " LEFT JOIN extracted_content ec ON f.id = ec.file_id"
+                ec_sel = ", ec.extraction_status"
+
+            # Join file_redundancy for is_duplicate + duplicate_similarity
+            fr_join = ""
+            fr_sel = ""
+            if _table_exists(conn, 'file_redundancy'):
+                fr_join = """
+                    LEFT JOIN LATERAL (
+                        SELECT avg_similarity
+                        FROM file_redundancy
+                        WHERE path_1 = f.path OR path_2 = f.path
+                        LIMIT 1
+                    ) fr ON TRUE
+                """
+                fr_sel = (
+                    ", CASE WHEN fr.avg_similarity IS NOT NULL THEN TRUE ELSE FALSE END AS is_duplicate"
+                    ", ROUND((COALESCE(fr.avg_similarity, 0) * 100)::numeric, 0) AS duplicate_similarity"
+                )
+
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label" + sel +
-                    " FROM files f LEFT JOIN file_scores fs ON f.id = fs.file_id" + join +
-                    " ORDER BY COALESCE(fs.importance_score,0) DESC LIMIT %s",
+                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label"
+                    + sel + ec_sel + fr_sel
+                    + " FROM files f LEFT JOIN file_scores fs ON f.id = fs.file_id"
+                    + join + ec_join + fr_join
+                    + " ORDER BY COALESCE(fs.importance_score,0) DESC LIMIT %s",
                     (limit,),
                 )
-                return cur.fetchall()
+                rows = cur.fetchall()
+
+            return [dict(r, icon=_icon_for_category(r.get("category"))) for r in rows]
     except Exception as e:
         log.error(f"list_files failed: {e}")
         raise HTTPException(500, "list_files failed")
-
 
 @app.get("/files/{file_id}")
 def file_detail(file_id: int):
@@ -625,27 +725,78 @@ def file_detail(file_id: int):
             if not _table_exists(conn, 'files'):
                 raise HTTPException(404, "files table not found")
             sel, join = _explanations_join_sql(conn)
+
+            ec_join = ""
+            ec_sel = ""
+            if _table_exists(conn, 'extracted_content'):
+                ec_join = " LEFT JOIN extracted_content ec ON f.id = ec.file_id"
+                ec_sel = ", ec.extraction_status"
+
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label" + sel +
-                    " FROM files f LEFT JOIN file_scores fs ON f.id = fs.file_id" + join +
-                    " WHERE f.id = %s",
+                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label"
+                    + sel + ec_sel
+                    + " FROM files f LEFT JOIN file_scores fs ON f.id = fs.file_id"
+                    + join + ec_join
+                    + " WHERE f.id = %s",
                     (file_id,),
                 )
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(404, "file not found")
-                return row
+                return dict(row, icon=_icon_for_category(row.get("category")))
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"file_detail failed: {e}")
         raise HTTPException(500, "file_detail failed")
 
-
 class ScanRequest(BaseModel):
     root_folder: str = Field(..., min_length=1)
+@app.get("/search")
+def search_files(q: str = "", limit: int = 30):
+    """Real semantic search: Qdrant relevance + full file metadata + signals."""
+    query = (q or "").strip()
+    if not query:
+        return []
 
+    try:
+        relevant = get_relevant_files(query, top_k=limit)
+    except Exception as e:
+        log.error(f"search_files relevance lookup failed: {e}")
+        raise HTTPException(500, "search_files failed")
+
+    if not relevant:
+        return []
+
+    file_ids = [r["file_id"] for r in relevant]
+    relevance_map = {r["file_id"]: r["relevance"] for r in relevant}
+    snippet_map = {r["file_id"]: r.get("snippet", "") for r in relevant}
+
+    try:
+        with db_conn() as conn:
+            if not _table_exists(conn, 'files'):
+                return []
+            sel, join = _explanations_join_sql(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label" + sel +
+                    " FROM files f LEFT JOIN file_scores fs ON f.id = fs.file_id" + join +
+                    " WHERE f.id = ANY(%s)",
+                    (file_ids,),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"search_files db lookup failed: {e}")
+        raise HTTPException(500, "search_files failed")
+
+    for row in rows:
+        fid = row["file_id"]
+        row["relevance"] = relevance_map.get(fid, 0.0)
+        row["snippet"] = snippet_map.get(fid, "")
+
+    rows.sort(key=lambda r: r.get("relevance", 0.0), reverse=True)
+    return rows
 
 @app.post("/scan")
 def scan_root_folder(req: ScanRequest):
@@ -657,12 +808,12 @@ def scan_root_folder(req: ScanRequest):
 
 
 @app.post("/upload-folder")
-def upload_folder(owner_id: str = Header(default="dashboard-user"), files: list[UploadFile] | None = File(default=None)):
+def upload_folder(x_owner_id: str = Header(default="dashboard-user"), files: list[UploadFile] | None = File(default=None)):
     """Upload a folder tree from the browser as individual files."""
     if not files:
         raise HTTPException(400, "No files uploaded.")
 
-    owner_key = _sanitize_owner_id(owner_id)
+    owner_key = _sanitize_owner_id(x_owner_id)
     upload_id = str(uuid.uuid4())
     destination_root = UPLOAD_ROOT / owner_key / upload_id
     destination_root.mkdir(parents=True, exist_ok=True)
@@ -681,11 +832,16 @@ def upload_folder(owner_id: str = Header(default="dashboard-user"), files: list[
             raise HTTPException(400, f"Invalid uploaded file path: {uploaded.filename}")
 
     log.info(f"Uploaded {len(saved_paths)} files for owner {owner_key} to {destination_root}")
-    # If SKIP_PIPELINE_ON_UPLOAD=1 is set, skip running the full pipeline
     skip_env = os.getenv("SKIP_PIPELINE_ON_UPLOAD", "0") == "1"
     skip_flag = (BASE_DIR / "skip_pipeline.flag").exists()
     if skip_env or skip_flag:
-        return {"status": "uploaded", "root_folder": str(destination_root), "skipped_pipeline": True}
+        log.info("Pipeline skipped (SKIP_PIPELINE_ON_UPLOAD or skip_pipeline.flag is set).")
+        return {
+            "status": "uploaded",
+            "root_folder": str(destination_root),
+            "skipped_pipeline": True,
+            "message": "Files uploaded successfully. Pipeline was skipped — run it manually to index the new files.",
+        }
     return _run_folder_pipeline(destination_root)
 
 
@@ -713,18 +869,28 @@ def review_queue(limit: int = 200):
             if not _table_exists(conn, 'files') or not _table_exists(conn, 'file_scores'):
                 return []
             sel, join = _explanations_join_sql(conn)
+
+            ec_join = ""
+            ec_sel = ""
+            if _table_exists(conn, 'extracted_content'):
+                ec_join = " LEFT JOIN extracted_content ec ON f.id = ec.file_id"
+                ec_sel = ", ec.extraction_status"
+
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label" + sel +
-                    " FROM files f JOIN file_scores fs ON f.id = fs.file_id" + join +
-                    " WHERE fs.label IN ('REVIEW','DELETE_CANDIDATE') ORDER BY fs.importance_score ASC LIMIT %s",
+                    "SELECT f.*, f.id AS file_id, fs.importance_score, fs.label"
+                    + sel + ec_sel
+                    + " FROM files f JOIN file_scores fs ON f.id = fs.file_id"
+                    + join + ec_join
+                    + " WHERE fs.label IN ('REVIEW','DELETE_CANDIDATE') ORDER BY fs.importance_score ASC LIMIT %s",
                     (limit,),
                 )
-                return cur.fetchall()
+                rows = cur.fetchall()
+
+            return [dict(r, icon=_icon_for_category(r.get("category"))) for r in rows]
     except Exception as e:
         log.error(f"review_queue failed: {e}")
         raise HTTPException(500, "review_queue failed")
-
 
 @app.post("/files/{file_id}/action")
 def files_action(file_id: int, payload: dict):
@@ -732,6 +898,17 @@ def files_action(file_id: int, payload: dict):
     user = payload.get('user') or 'ui'
     if action not in ('KEEP', 'ARCHIVE', 'DELETE', 'REVIEWED'):
         raise HTTPException(400, 'invalid action')
+
+    # Map the UI's action verbs onto ph7's real label set. REVIEWED ("Skip")
+    # carries no actual decision -- it is logged for the audit trail only,
+    # and never touches file_scores or the feedback/training loop.
+    ACTION_TO_LABEL = {
+        'KEEP': 'KEEP',
+        'ARCHIVE': 'ARCHIVE',
+        'DELETE': 'DELETE_CANDIDATE',
+    }
+    new_label = ACTION_TO_LABEL.get(action)
+
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
@@ -742,8 +919,51 @@ def files_action(file_id: int, payload: dict):
                     "INSERT INTO file_actions (file_id, action, actor) VALUES (%s, %s, %s)",
                     (str(file_id), action, user),
                 )
+
+            if new_label is not None:
+                # Look up the AI's current label/score before overwriting it,
+                # so we can tell ph11 whether this was an APPROVE (human
+                # agreed) or a REJECT (human overrode the AI).
+                predicted_label = None
+                predicted_score = None
+                if _table_exists(conn, 'file_scores'):
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute(
+                            "SELECT label, importance_score FROM file_scores WHERE file_id = %s",
+                            (file_id,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            predicted_label = row["label"]
+                            predicted_score = row["importance_score"]
+
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE file_scores SET label = %s WHERE file_id = %s",
+                            (new_label, file_id),
+                        )
+
             conn.commit()
-        return {"status": "ok"}
+
+        # Log the human decision for Phase 11's retraining loop. This is a
+        # best-effort step: if ph11 is unavailable or feedback insertion
+        # fails for any reason, the file_scores update above has already
+        # been committed, so the UI still reflects the decision immediately.
+        if new_label is not None and ph11 is not None:
+            try:
+                decision = "APPROVE" if predicted_label == new_label else "REJECT"
+                ph11.record_feedback(
+                    file_id=file_id,
+                    human_label=new_label,
+                    decision=decision,
+                    predicted_label=predicted_label,
+                    predicted_score=predicted_score,
+                    reviewer=user,
+                )
+            except Exception as e:
+                log.warning(f"Could not record feedback for file {file_id}: {e}")
+
+        return {"status": "ok", "label": new_label}
     except Exception as e:
         log.error(f"files_action failed: {e}")
         raise HTTPException(500, "files_action failed")
@@ -812,6 +1032,50 @@ def feedback_retrain(payload: dict | None = None):
         log.error(f"feedback_retrain failed: {e}")
         raise HTTPException(500, "feedback_retrain failed")
 
+
+@app.get("/folders/roots")
+def folders_roots():
+    """Return filesystem root(s) for the folder browser."""
+    roots = []
+    if platform.system() == "Windows":
+        import string
+        for drive in string.ascii_uppercase:
+            p = Path(f"{drive}:\\")
+            if p.exists():
+                roots.append({"name": f"{drive}:", "path": str(p), "is_dir": True})
+    else:
+        roots.append({"name": "/", "path": "/", "is_dir": True})
+        home = Path.home()
+        if home.exists():
+            roots.append({"name": f"Home ({home.name})", "path": str(home), "is_dir": True})
+    return {"items": roots}
+
+
+@app.get("/folders/browse")
+def folders_browse(path: str = ""):
+    """List directories (and a few files) at the given path."""
+    if not path:
+        return folders_roots()
+
+    target = Path(path)
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(400, f"Path not found or not a directory: {path}")
+
+    items = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+            try:
+                items.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "is_dir": entry.is_dir(),
+                })
+            except PermissionError:
+                continue
+    except PermissionError:
+        raise HTTPException(403, f"Permission denied: {path}")
+
+    return {"current_path": str(target), "items": items}
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, x_owner_id: str = Header(default="default")):

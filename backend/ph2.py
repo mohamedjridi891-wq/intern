@@ -61,10 +61,10 @@ def _move_to_review(path: str) -> bool:
         if path_obj.is_absolute():
             try:
                 rel_path = path_obj.relative_to(Path.cwd())
-            except Exception:
-                rel_path = Path(path_obj.drive.rstrip(":")) / path_obj.relative_to(path_obj.anchor)
+            except ValueError:
+                rel_path = Path(path_obj.name)
         else:
-            rel_path = path_obj
+            rel_path = Path(path_obj.name)
 
         destination = review_root / rel_path
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -104,7 +104,7 @@ openpyxl_mod = _try_import("openpyxl", "openpyxl")
 pptx_mod = _try_import("pptx", "python-pptx")
 langdetect_mod = _try_import("langdetect", "langdetect")
 unstructured_mod = _try_import("unstructured.partition.auto", "unstructured")
-
+markitdown_mod = _try_import("markitdown", "markitdown[all]")
 if fitz_mod:
     try:
         import fitz
@@ -612,7 +612,20 @@ def extract_strings(path, extension, category=""):
     if text:
         return text[:max_chars], "strings_extracted"
     return "", "FAILED"
-
+def extract_via_markitdown(path):
+    """Use MarkItDown as a fallback extractor for any file type."""
+    if not markitdown_mod:
+        return "", "FAILED"
+    try:
+        from markitdown import MarkItDown
+        md = MarkItDown()
+        result = md.convert(path)
+        text = result.text_content.strip() if result and result.text_content else ""
+        if text:
+            return text, "markitdown"
+    except Exception as e:
+        logging.warning(f"MarkItDown failed for {path}: {e}")
+    return "", "FAILED"
 
 def route_extraction(path, extension, category=""):
     ext = extension.lower()
@@ -642,7 +655,10 @@ def route_extraction(path, extension, category=""):
         return "", "SKIPPED"
     if category in ("Code", "Config", "Script", "Security", "Data"):
         return extract_text_file(path)
-    return extract_via_unstructured(path)
+    text, method = extract_via_unstructured(path)
+    if text:
+        return text, method
+    return extract_via_markitdown(path)
 
 
 def _detect_language(text):
@@ -707,9 +723,9 @@ def _process_single_row(args):
         if source == "":
             text, method = route_extraction(path, extension, category)
             ocr_applied = "ocr" in method.lower()
-        elif source.endswith(".zip"):
+        elif source.lower().endswith(".zip"):
             text, method, ocr_applied = extract_from_zip_entry(path, category)
-        elif source.endswith(".rar"):
+        elif source.lower().endswith(".rar"):
             text, method, ocr_applied = extract_from_rar_entry(path, category)
         else:
             text, method = "", "SKIPPED"
@@ -902,7 +918,8 @@ def run_phase2(inventory_csv="file_inventory.csv", output_csv="extracted_content
                         failed += 1
                         _done = done_count
                 if len(to_insert) >= 50:
-                    flush_inserted()
+                    with lock:
+                        flush_inserted()
                 if _done % 50 == 0 or _done == total:
                     pct = _done / total * 100
                     bar = "█" * int(pct // 5) + "░" * (20 - int(pct // 5))

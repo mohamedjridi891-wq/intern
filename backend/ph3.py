@@ -12,6 +12,15 @@ from html.parser import HTMLParser
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from dotenv import load_dotenv
+def _try_markitdown():
+    try:
+        from markitdown import MarkItDown
+        return MarkItDown()
+    except ImportError:
+        logging.warning("markitdown not installed — pip install markitdown")
+        return None
+
+_markitdown = _try_markitdown()
 
 load_dotenv()
 
@@ -158,7 +167,32 @@ def _remove_ocr_noise(text: str) -> str:
     for pattern in _OCR_NOISE:
         text = pattern.sub(" ", text)
     return text
-
+def convert_with_markitdown(raw_text: str, extension: str = "") -> str:
+    """
+    Run MarkItDown on raw extracted text to normalize it to clean Markdown
+    before the standard cleaning pipeline processes it.
+    Only applied when markitdown is available and text is substantial.
+    """
+    if not _markitdown or not raw_text or len(raw_text) < 50:
+        return raw_text
+    # MarkItDown works on files; for already-extracted text we write to a
+    # temp .md buffer and convert, getting back normalized Markdown
+    try:
+        import tempfile, os
+        ext = extension.lower().lstrip(".") or "txt"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=f".{ext}", delete=False,
+            encoding="utf-8", errors="replace"
+        ) as tmp:
+            tmp.write(raw_text)
+            tmp_path = tmp.name
+        result = _markitdown.convert(tmp_path)
+        converted = result.text_content if hasattr(result, "text_content") else str(result)
+        os.unlink(tmp_path)
+        return converted if converted and len(converted) > 20 else raw_text
+    except Exception as e:
+        logging.warning(f"MarkItDown conversion failed: {e}")
+        return raw_text
 
 def clean_text(raw_text: str, extraction_method: str = "") -> str:
     if not raw_text or not isinstance(raw_text, str):
@@ -180,6 +214,7 @@ def clean_text(raw_text: str, extraction_method: str = "") -> str:
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     if not text:
         return []
+    overlap = min(overlap, chunk_size - 1) 
     words = text.split()
     if len(words) <= chunk_size:
         return [text] if len(words) >= MIN_CHUNK_WORDS else []
@@ -375,7 +410,12 @@ def insert_chunk_rows(conn, rows):
             extracted_text, extraction_method, extraction_status,
             ocr_applied, language_hint
         ) VALUES %s
-        ON CONFLICT (chunk_id) DO NOTHING
+        ON CONFLICT (chunk_id) DO UPDATE SET
+            clean_text = EXCLUDED.clean_text,
+            clean_status = EXCLUDED.clean_status,
+            clean_char_count = EXCLUDED.clean_char_count,
+            clean_word_count = EXCLUDED.clean_word_count,
+            language = EXCLUDED.language
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, rows)
@@ -427,7 +467,7 @@ def run_phase3(extracted_csv="extracted_content.csv", output_csv="cleaned_chunks
         phase1_st = _safe_str(row.get("phase1_status", ""))
 
         if ext_status in ("FAILED", "SKIPPED") or not raw_text.strip():
-            chunk_id = f"{row['file_id']}_0"
+            chunk_id = f"{row['extracted_content_id']}_0"
             batch.append((
                 chunk_id,
                 0,
@@ -470,12 +510,13 @@ def run_phase3(extracted_csv="extracted_content.csv", output_csv="cleaned_chunks
         if file_hash and file_hash in reuse_map:
             cleaned = reuse_map[file_hash]
         else:
-            cleaned = clean_text(raw_text, ext_method)
+            md_text = convert_with_markitdown(raw_text, extension)
+            cleaned = clean_text(md_text, ext_method)
             if file_hash and not file_hash.startswith("error"):
                 reuse_map[file_hash] = cleaned
 
         if not cleaned.strip():
-            chunk_id = f"{row['file_id']}_0"
+            chunk_id = f"{row['extracted_content_id']}_0"
             batch.append((
                 chunk_id,
                 0,
@@ -520,7 +561,7 @@ def run_phase3(extracted_csv="extracted_content.csv", output_csv="cleaned_chunks
             existing_lang = _safe_str(row.get("language_hint", "")).strip()
             language = existing_lang or detect_language(chunk)
             batch.append((
-                f"{row['file_id']}_{c_idx}",
+                f"{row['extracted_content_id']}_{c_idx}",
                 c_idx,
                 len(chunks),
                 _clean_text_for_db(chunk),

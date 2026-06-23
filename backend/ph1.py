@@ -159,8 +159,7 @@ FILE_TYPES = {
     ".enumerated": "Data",  ".sp3": "Data",
 
     # Config
-    ".ini": "Config",       ".cfg": "Config",       ".conf": "Config",
-    ".env": "Config",       ".cfg": "Config",       ".conf": "Config",
+    ".ini": "Config",       ".conf": "Config",       ".cfg": "Config",       
     ".env": "Config",       ".properties": "Config", ".reg": "Config",
     ".plist": "Config",     ".config": "Config",    ".prefs": "Config",
     ".policy": "Config",    ".manifest": "Config",  ".inf": "Config",
@@ -299,7 +298,22 @@ def insert_rows(conn, rows):
             created_time, modified_time, access_time,
             hash, status, source_archive
         ) VALUES %s
-        ON CONFLICT (path) DO NOTHING
+        ON CONFLICT (path) DO UPDATE SET
+            name = EXCLUDED.name,
+            stem = EXCLUDED.stem,
+            extension = EXCLUDED.extension,
+            category = EXCLUDED.category,
+            folder = EXCLUDED.folder,
+            depth = EXCLUDED.depth,
+            size_mb = EXCLUDED.size_mb,
+            size_bytes = EXCLUDED.size_bytes,
+            is_empty = EXCLUDED.is_empty,
+            created_time = EXCLUDED.created_time,
+            modified_time = EXCLUDED.modified_time,
+            access_time = EXCLUDED.access_time,
+            hash = EXCLUDED.hash,
+            status = EXCLUDED.status,
+            source_archive = EXCLUDED.source_archive
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, rows)
@@ -358,7 +372,7 @@ def move_to_review(file_path: Path, root_path: Path) -> bool:
         try:
             rel_path = file_path.relative_to(root_path)
         except Exception:
-            rel_path = file_path.name
+            rel_path = Path(file_path.name)
         target = review_root / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(file_path), str(target))
@@ -482,7 +496,7 @@ def scan_rar(rar_path: Path, base_depth: int, append_row, counters: dict) -> boo
             counters["rar"] += 1
         return True
     except rarfile.BadRarFile:
-        print(f"  ⚠  Bad/corrupt rar — moved to review: {rar_path}")
+        print(f"  ⚠  Bad/corrupt RAR — skipped: {rar_path}")
         return False
     except rarfile.NeedFirstVolume:
         print(f"  ⚠  Multi-volume RAR (not first volume) — skipped: {rar_path}")
@@ -544,14 +558,9 @@ def run_phase1(root_folder: str = ROOT_FOLDER):
         status = get_status(ext, size_bytes)
 
         if status == "DELETE_CANDIDATE":
-            try:
-                file.unlink()
-                counters["deleted"] += 1
-                print(f"  ✂ Deleted DELETE_CANDIDATE: {file}")
-            except Exception as e:
-                logging.warning(f"Could not delete {file}: {e}")
-                print(f"  ⚠  Could not delete {file}: {e}")
-            continue
+            counters["deleted"] += 1
+            print(f"  ⚠ Delete candidate: {file}")
+            
 
         if category in REVIEW_CATEGORIES:
             if move_to_review(file, root):
@@ -599,7 +608,9 @@ def run_phase1(root_folder: str = ROOT_FOLDER):
             folder=str(file.parent),
             depth=depth,
             size_bytes=size_bytes,
-            created=datetime.fromtimestamp(stat.st_ctime),
+            created=datetime.fromtimestamp(
+                getattr(stat, "st_birthtime", stat.st_ctime)
+            ),
             modified=datetime.fromtimestamp(stat.st_mtime),
             accessed=datetime.fromtimestamp(stat.st_atime),
             file_hash=hash_file(str(file)),

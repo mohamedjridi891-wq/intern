@@ -3,7 +3,6 @@ numpy
 psycopg2-binary
 sentence-transformers
 huggingface-hub
-faiss-cpu
 torch
 python-dotenv
 qdrant-client
@@ -20,3 +19,4 @@ pymupdf
 pytesseract
 langdetect
 rarfile
+markitdown[all]

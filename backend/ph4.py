@@ -108,9 +108,8 @@ def _setup_log_table(conn):
             cur.execute("ALTER TABLE embeddings_log DROP COLUMN faiss_row")
 
         if not has_qdrant_column:
-            cur.execute("ALTER TABLE embeddings_log ADD COLUMN qdrant_point_id INTEGER")
-            cur.execute("UPDATE embeddings_log SET qdrant_point_id = -1 WHERE qdrant_point_id IS NULL")
-            cur.execute("ALTER TABLE embeddings_log ALTER COLUMN qdrant_point_id SET NOT NULL")
+            if not has_qdrant_column:
+                cur.execute("ALTER TABLE embeddings_log ADD COLUMN qdrant_point_id INTEGER DEFAULT -1 NOT NULL")
     conn.commit()
 
 
@@ -242,12 +241,15 @@ def run_phase4(model_name: str = EMBED_MODEL) -> int:
     try:
         collection_info = client.get_collection(QDRANT_COLLECTION)
         print(f"  Loaded collection : {collection_info.points_count:,} existing vectors")
-        chunk_index = json.load(open(CHUNK_INDEX_PATH, encoding="utf-8"))
         next_point_id = collection_info.points_count
     except Exception:
         _build_collection(client, QDRANT_COLLECTION, dim, total)
-        chunk_index = []
         next_point_id = 0
+
+    if os.path.exists(CHUNK_INDEX_PATH):
+        chunk_index = json.load(open(CHUNK_INDEX_PATH, encoding="utf-8"))
+    else:
+        chunk_index = []
 
     # Embed and insert batch by batch (Qdrant doesn't need pre-training like IVFFlat)
     t0 = time.time()
@@ -304,6 +306,13 @@ def run_phase4(model_name: str = EMBED_MODEL) -> int:
     return inserted
 
 # ── Phase 5 — Search ─────────────────────────────────────────────────────────
+_model_cache: dict = {}
+
+def _get_model(model_name: str):
+    if model_name not in _model_cache:
+        from sentence_transformers import SentenceTransformer
+        _model_cache[model_name] = SentenceTransformer(model_name)
+    return _model_cache[model_name]
 
 def search(
     query: str,
@@ -329,7 +338,7 @@ def search(
     else:
         chunk_index = []
 
-    q_vec = SentenceTransformer(model_name).encode(
+    q_vec = _get_model(model_name).encode(
         [query], normalize_embeddings=True, convert_to_numpy=True
     ).astype("float32")[0].tolist()
 
@@ -440,6 +449,10 @@ def find_duplicate_chunks(similarity_threshold: float = 0.95, store: bool = Fals
             stop_after = True
         else:
             stop_after = False
+
+        if not points:
+            break
+
         
         requests = [
             qdrant_models.QueryRequest(
@@ -487,7 +500,8 @@ def find_duplicate_chunks(similarity_threshold: float = 0.95, store: bool = Fals
                 key = (min(a_cid, nb_cid), max(a_cid, nb_cid))
                 if score > pairs.get(key, -1):
                     pairs[key] = score
-
+        if stop_after:
+            break
     if not pairs:
         return pd.DataFrame(columns=["chunk_id_1", "chunk_id_2", "similarity_score"])
 

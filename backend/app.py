@@ -6,7 +6,7 @@ Phases breakdown:
   - ph1: File indexing (crawl filesystem, compute hashes)
   - ph2: Content extraction (text/metadata from files)
   - ph3: Chunking (break content into embeddings-friendly pieces)
-  - ph4: FAISS embeddings + search (vectorize chunks, build index)
+  - ph4: Qdrant embeddings + search (vectorize chunks, build vector index)
   - ph5: ?
   - ph6: Duplicate detection (file_redundancy)
   - ph7: Scoring (9 signals -> importance_score + label)

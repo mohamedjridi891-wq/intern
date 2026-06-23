@@ -195,65 +195,136 @@ def _fetch_duplicate_paths(conn) -> set:
 
 
 def _fetch_embeddings(conn) -> dict:
-    print(" [3/7] Loading embeddings from FAISS …")
-    faiss_path = os.getenv("FAISS_PATH", "vector_store.faiss")
-    index_path = os.getenv("CHUNK_INDEX_PATH", "chunk_index.json")
+    """
+    Load file-level embeddings by averaging chunk vectors from Qdrant.
+    Falls back to empty dict if Qdrant is unavailable — scoring still
+    runs but S7 (cluster_density) and S9 (semantic_proximity) will be
+    0.0 for every file, which significantly weakens the model.
+    Run Phase 4 first to populate Qdrant before Phase 7.
+    """
+    print(" [3/7] Loading embeddings from Qdrant …")
 
-    if not Path(faiss_path).exists() or not Path(index_path).exists():
-        print(" → FAISS files not found — S7/S9 will be 0")
-        return {}
+    QDRANT_HOST       = os.getenv("QDRANT_HOST", "localhost")
+    QDRANT_PORT       = int(os.getenv("QDRANT_PORT", 6333))
+    QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "embeddings")
+    CHUNK_INDEX_PATH  = str(Path(os.getenv("CHUNK_INDEX_PATH", "chunk_index.json")).resolve())
 
     try:
-        import faiss
-        index = faiss.read_index(faiss_path)
-        with open(index_path, "r", encoding="utf-8") as f:
-            chunk_index = json.load(f)
+        from qdrant_client import QdrantClient
+        import numpy as np
 
-        n = index.ntotal
-        dim = index.d
-        print(f" → FAISS index: {n:,} vectors, dim={dim}")
+        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        collection_info = client.get_collection(QDRANT_COLLECTION)
+        total = collection_info.points_count
+        if total == 0:
+            logging.warning(
+                "Qdrant collection '%s' is empty. "
+                "Signals S7 (cluster_density) and S9 (semantic_proximity) will be 0 for all files. "
+                "Run Phase 4 first to embed chunks into Qdrant.",
+                QDRANT_COLLECTION,
+            )
+            print(
+                f" ⚠  WARNING: Qdrant collection '{QDRANT_COLLECTION}' is empty.\n"
+                f"     S7 (cluster density) and S9 (semantic proximity) will be 0 for every file.\n"
+                f"     Run Phase 4 (ph4.py) before Phase 7 to fix this."
+            )
+            return {}
 
-        all_vecs = np.zeros((n, dim), dtype=np.float32)
-        for i in range(n):
-            all_vecs[i] = index.reconstruct(i)
+        if not Path(CHUNK_INDEX_PATH).exists():
+            logging.warning(
+                "chunk_index.json not found at %s. "
+                "Signals S7 and S9 will be 0 for all files. "
+                "Run Phase 4 to regenerate it.",
+                CHUNK_INDEX_PATH,
+            )
+            print(
+                f" ⚠  WARNING: chunk_index.json not found at {CHUNK_INDEX_PATH}.\n"
+                f"     S7 (cluster density) and S9 (semantic proximity) will be 0 for every file.\n"
+                f"     Run Phase 4 (ph4.py) before Phase 7 to regenerate it."
+            )
+            return {}
 
-        file_vecs = defaultdict(list)
-        chunk_ids_to_resolve = []
+        import json
+        with open(CHUNK_INDEX_PATH, encoding="utf-8") as f:
+            chunk_index = json.load(f)   # list of chunk_id strings
 
-        for i, entry in enumerate(chunk_index):
-            if i >= n:
+        print(f" → Qdrant: {total:,} vectors, chunk_index: {len(chunk_index):,} entries")
+
+        # Build chunk_id → file_id map from the DB
+        chunk_ids = [cid for cid in chunk_index if cid]
+        if not chunk_ids:
+            return {}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT chunk_id, file_id FROM chunks WHERE chunk_id = ANY(%s)",
+                (chunk_ids,)
+            )
+            chunk_to_file = {row[0]: row[1] for row in cur.fetchall()}
+
+        # Scroll Qdrant in batches to get vectors + build per-file averages
+        file_vecs: dict[int, list] = {}
+        offset = None
+        batch_size = 256
+
+        while True:
+            scroll_result = client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                limit=batch_size,
+                offset=offset,
+                with_vectors=True,
+                with_payload=True,
+            )
+            points, next_offset = scroll_result
+
+            if not points:
                 break
-            if isinstance(entry, dict):
-                fid = entry.get("file_id") or entry.get("fileId")
-                if fid is not None:
-                    file_vecs[int(fid)].append(all_vecs[i])
+
+            for point in points:
+                # Prefer payload chunk_id (set during ph4 upsert)
+                chunk_id = None
+                if getattr(point, "payload", None):
+                    chunk_id = point.payload.get("chunk_id")
+                if chunk_id is None:
+                    # Fall back to positional chunk_index lookup
+                    try:
+                        chunk_id = chunk_index[point.id]
+                    except (IndexError, KeyError):
+                        continue
+
+                file_id = chunk_to_file.get(chunk_id)
+                if file_id is None:
                     continue
-            # string chunk_id
-            chunk_id = entry if isinstance(entry, (str, int)) else None
-            if chunk_id:
-                chunk_ids_to_resolve.append((i, str(chunk_id)))
 
-        if chunk_ids_to_resolve:
-            ids = [cid for _, cid in chunk_ids_to_resolve]
-            with conn.cursor() as cur:
-                cur.execute("SELECT chunk_id, file_id FROM chunks WHERE chunk_id = ANY(%s)", (ids,))
-                mapping = {row[0]: row[1] for row in cur.fetchall()}
-            for i, chunk_id in chunk_ids_to_resolve:
-                fid = mapping.get(chunk_id)
-                if fid:
-                    file_vecs[int(fid)].append(all_vecs[i])
+                vec = point.vector
+                if vec is None:
+                    continue
 
+                if file_id not in file_vecs:
+                    file_vecs[file_id] = []
+                file_vecs[file_id].append(np.array(vec, dtype=np.float32))
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        # Average chunk vectors → single file embedding
         emb_map = {
             fid: np.mean(np.vstack(vecs), axis=0).astype(np.float32)
-            for fid, vecs in file_vecs.items() if len(vecs) > 0
+            for fid, vecs in file_vecs.items()
+            if vecs
         }
-        print(f" → {len(emb_map):,} file embeddings created")
+        print(f" → {len(emb_map):,} file embeddings built from Qdrant")
         return emb_map
-    except Exception as e:
-        logging.error(f"FAISS load failed: {e}")
-        print(f" → FAISS failed: {e} — S7/S9 = 0")
-        return {}
 
+    except Exception as e:
+        logging.error(f"Qdrant embedding load failed: {e}")
+        print(
+            f" ⚠  WARNING: Qdrant unavailable ({e}).\n"
+            f"     S7 (cluster density) and S9 (semantic proximity) will be 0 for every file.\n"
+            f"     Check that Qdrant is running and Phase 4 has completed."
+        )
+        return {}
 
 def _fetch_top_chunks(conn, file_ids: list) -> dict:
     if not file_ids:
@@ -289,11 +360,15 @@ def _s_content_richness(word_count) -> float:
 
 def _s_recency(modified, accessed) -> float:
     now = datetime.now(timezone.utc)
-    best = max((dt for dt in (modified, accessed) if dt), default=None)
+    def _make_aware(dt):
+        if dt is None:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    candidates = [_make_aware(dt) for dt in (modified, accessed) if dt]
+    best = max(candidates, default=None)
     if best is None:
         return 0.0
-    if best.tzinfo is None:
-        best = best.replace(tzinfo=timezone.utc)
     return float(1.0 - min((now - best).days / MAX_STALENESS_DAYS, 1.0))
 
 
@@ -335,7 +410,7 @@ def _s_content_depth(chunk_total) -> float:
 def _compute_traditional_signals(df: pd.DataFrame, dup_paths: set) -> pd.DataFrame:
     print(" [4/7] Computing traditional signals S1–S6 …")
     df["s_content_richness"] = df.apply(
-        lambda r: _s_content_richness(r.get("clean_word_count") or r.get("extracted_words") or 0), axis=1)
+        lambda r: _s_content_richness(r["clean_word_count"] if pd.notna(r.get("clean_word_count")) else (r["extracted_words"] if pd.notna(r.get("extracted_words")) else 0)), axis=1)
     df["s_recency"] = df.apply(lambda r: _s_recency(r["modified_time"], r["access_time"]), axis=1)
     df["s_type_importance"] = df["extension"].apply(_s_type_importance)
     df["s_uniqueness"] = df["path"].apply(lambda p: _s_uniqueness(p, dup_paths))
@@ -398,7 +473,8 @@ def _call_groq_batch(texts: list[str]) -> list[float]:
     new_entries = {}
 
     for text in texts:
-        key = hash(text[:800])
+        import hashlib
+        key = hashlib.md5(text[:800].encode("utf-8", errors="replace")).hexdigest()
         if key in cache:
             results.append(cache[key])
             continue
@@ -499,7 +575,7 @@ def _bootstrap_labels(df: pd.DataFrame) -> np.ndarray:
                              np.where(raw >= 20, 1, 0)))
 
 
-def _get_model(df: pd.DataFrame, X: np.ndarray) -> RandomForestClassifier:
+def _get_rf_model(df: pd.DataFrame, X: np.ndarray) -> RandomForestClassifier:
     if Path(MODEL_PATH).exists():
         print(f" Loading existing model from {MODEL_PATH}")
         return joblib.load(MODEL_PATH)
@@ -508,8 +584,11 @@ def _get_model(df: pd.DataFrame, X: np.ndarray) -> RandomForestClassifier:
     y = _bootstrap_labels(df)
     rf = RandomForestClassifier(**RF_PARAMS)
     if len(X) >= 10:
-        cv = cross_val_score(rf, X, y, cv=min(5, len(X)//2), scoring="accuracy")
-        print(f" Cross-val accuracy: {cv.mean():.3f} ± {cv.std():.3f}")
+        try:
+            cv = cross_val_score(rf, X, y, cv=min(5, len(X)//2), scoring="accuracy")
+            print(f" Cross-val accuracy: {cv.mean():.3f} ± {cv.std():.3f}")
+        except ValueError as e:
+            print(f" (skipping cross-validation diagnostic: {e})")
     rf.fit(X, y)
     joblib.dump(rf, MODEL_PATH)
     print(f" Model saved → {MODEL_PATH}")
@@ -624,7 +703,7 @@ def run_phase7(max_files: int = None, dry_run: bool = False, force_retrain: bool
     if force_retrain and Path(MODEL_PATH).exists():
         Path(MODEL_PATH).unlink()
 
-    rf = _get_model(df, X)
+    rf = _get_rf_model(df, X)
 
     print(" Scoring with Random Forest …")
     scores, labels = _rf_score(rf, X)

@@ -8,6 +8,7 @@ import { KpiCard, SectionCard } from '../components/Shared'
 import StatusBadge from '../components/StatusBadge'
 import WhyExplain from '../components/WhyExplain'
 import { formatSize, timeAgo } from '../lib/format'
+import { useFolderContext } from '../components/FolderContext.jsx'
 import { 
   fetchFiles, fetchReviewQueue, uploadFolder,
   computeKPIs, computeStatusBreakdown, getBiggestWasters, generateStorageTrend,
@@ -15,8 +16,8 @@ import {
 } from '../lib/api'
 
 export default function Overview() {
+  const { selectedFolder, setSelectedFolder } = useFolderContext()
   const [scanning, setScanning] = useState(false)
-  const [selectedFolder, setSelectedFolder] = useState('')
   const [scanStatus, setScanStatus] = useState('')
   const [selectedFiles, setSelectedFiles] = useState([])
   const folderInputRef = useRef(null)
@@ -74,6 +75,18 @@ export default function Overview() {
 
     try {
       const data = await uploadFolder(selectedFiles)
+
+      if (data.skipped_pipeline) {
+        setScanStatus(
+          `⚠ Files uploaded to ${data.root_folder} but the pipeline was skipped. ` +
+          `Run the pipeline manually (python run_pipeline.py) to index the new files.`
+        )
+        setSelectedFiles([])
+        setSelectedFolder('')
+        // Do NOT call loadData() — the DB hasn't changed, showing stale data with no warning is misleading
+        return
+      }
+
       setScanStatus(`✓ Scan complete on ${data.root_folder}`)
       setSelectedFiles([])
       setSelectedFolder('')
@@ -250,7 +263,7 @@ export default function Overview() {
                     <p className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">{w.name}</p>
                     <p className="text-xs text-slate-400">{w.type}</p>
                   </div>
-                  <span className="shrink-0 text-sm font-semibold text-slate-600 dark:text-slate-300">{formatSize(w.sizeMb * 1024 * 1024)}</span>
+                  <span className="shrink-0 text-sm font-semibold text-slate-600 dark:text-slate-300">{formatSize(w.sizeMb)}</span>
                 </li>
               ))}
             </ul>

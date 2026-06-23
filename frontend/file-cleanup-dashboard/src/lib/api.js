@@ -21,6 +21,21 @@ export async function fetchFiles(limit = 500) {
     return []
   }
 }
+/**
+ * Real semantic search against the Qdrant-backed /search endpoint
+ */
+export async function searchFiles(query, limit = 30) {
+  try {
+    const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=${limit}`, {
+      headers: { 'X-Owner-Id': OWNER_ID },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return await res.json()
+  } catch (err) {
+    console.error('searchFiles failed:', err)
+    throw err
+  }
+}
 
 /**
  * Fetch duplicates list
@@ -219,10 +234,10 @@ export async function uploadFolder(files) {
  * Get status metadata
  */
 export const STATUS_META = {
-  KEEP: { label: 'Keep', color: '#16A34A' },
-  ARCHIVE: { label: 'Archive', color: '#D97706' },
-  REVIEW: { label: 'Review', color: '#CA8A04' },
-  DELETE_CANDIDATE: { label: 'Delete candidate', color: '#DC2626' },
+  KEEP:             { label: 'Keep',             color: '#16A34A', badgeClass: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' },
+  ARCHIVE:          { label: 'Archive',           color: '#D97706', badgeClass: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' },
+  REVIEW:           { label: 'Review',            color: '#CA8A04', badgeClass: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' },
+  DELETE_CANDIDATE: { label: 'Delete candidate',  color: '#DC2626', badgeClass: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' },
 }
 
 /**
