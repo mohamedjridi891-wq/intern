@@ -1,10 +1,13 @@
 export function formatSize(mb) {
+  if (mb == null || Number.isNaN(mb)) return '—'
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`
   return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`
 }
 
 export function timeAgo(iso) {
+  if (!iso) return 'Never'
   const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return 'Never'
   const diffMs = Date.now() - d.getTime()
   const days = Math.floor(diffMs / (1000 * 60 * 60 * 24))
   if (days === 0) return 'Today'
@@ -16,5 +19,8 @@ export function timeAgo(iso) {
 }
 
 export function formatDate(iso) {
-  return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }

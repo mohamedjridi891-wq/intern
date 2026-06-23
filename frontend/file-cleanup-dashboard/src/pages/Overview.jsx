@@ -3,15 +3,15 @@ import { Link } from 'react-router-dom'
 import {
   HardDrive, Files, Trash2, ListChecks, Copy, Clock, ArrowRight, RefreshCw, Folder,
 } from 'lucide-react'
-import { PieChart, Pie, Cell, ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts'
-import { KpiCard, SectionCard } from '../components/Shared'
+import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts'
+import { KpiCard, SectionCard, EmptyState } from '../components/Shared'
 import StatusBadge from '../components/StatusBadge'
 import WhyExplain from '../components/WhyExplain'
 import { formatSize, timeAgo } from '../lib/format'
 import { useFolderContext } from '../components/FolderContext.jsx'
-import { 
-  fetchFiles, fetchReviewQueue, uploadFolder,
-  computeKPIs, computeStatusBreakdown, getBiggestWasters, generateStorageTrend,
+import {
+  fetchFiles, fetchReviewQueue, fetchDuplicates, uploadFolder,
+  computeKPIs, computeStatusBreakdown, getBiggestWasters,
   STATUS_META,
 } from '../lib/api'
 
@@ -25,6 +25,7 @@ export default function Overview() {
   // Real data from backend
   const [files, setFiles] = useState([])
   const [reviewQueue, setReviewQueue] = useState([])
+  const [duplicates, setDuplicates] = useState([])
   const [loaded, setLoaded] = useState(false)
 
   // Load data after component mounts or after scan
@@ -34,12 +35,14 @@ export default function Overview() {
 
   async function loadData() {
     try {
-      const [filesData, reviewData] = await Promise.all([
+      const [filesData, reviewData, duplicatesData] = await Promise.all([
         fetchFiles(5000),
         fetchReviewQueue(500),
+        fetchDuplicates(500),
       ])
       setFiles(filesData || [])
       setReviewQueue(reviewData || [])
+      setDuplicates(duplicatesData || [])
       setLoaded(true)
     } catch (err) {
       console.error('Failed to load data:', err)
@@ -59,7 +62,7 @@ export default function Overview() {
       const pathParts = folderPath.split(/[\\/]/)
       folderPath = pathParts.slice(0, -1).join('\\')
       setSelectedFolder(folderPath || filesArray[0].name)
-      setScanStatus(`Selected: ${folderPath || filesArray[0].name}`)
+      setScanStatus(`Selected: ${folderPath || filesArray[0].name} (${filesArray.length} files)`)
     }
   }
 
@@ -99,29 +102,28 @@ export default function Overview() {
     }
   }
 
-  // Compute derived data from real backend data
+  // Compute derived data from real backend data only — no fabricated values.
   const kpis = loaded
-    ? computeKPIs(files, reviewQueue)
+    ? computeKPIs(files, reviewQueue, duplicates)
     : {
       totalFiles: 0,
       storageUsedGb: 0,
       storageReclaimableGb: 0,
       pendingReview: 0,
       duplicatesFound: 0,
-      lastScan: new Date().toISOString(),
+      lastScan: null,
     }
-  
+
   const statusBreakdown = loaded
     ? computeStatusBreakdown(reviewQueue)
     : []
-  
+
   const biggestWasters = loaded
     ? getBiggestWasters(files, 5)
     : []
-  
-  const storageTrend = generateStorageTrend(kpis.storageUsedGb)
-  
+
   const reviewItems = reviewQueue.slice(0, 5)
+  const hasAnyData = loaded && files.length > 0
 
   return (
     <div className="space-y-6">
@@ -138,7 +140,7 @@ export default function Overview() {
           className="focus-ring inline-flex items-center gap-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-60"
         >
           <RefreshCw className={`h-4 w-4 ${scanning ? 'animate-spin' : ''}`} />
-          {scanning ? 'Scanning…' : 'Rescan folder'}
+          {scanning ? 'Scanning…' : 'Refresh data'}
         </button>
       </div>
 
@@ -201,7 +203,15 @@ export default function Overview() {
         <KpiCard icon={Clock} label="Last scan" value={timeAgo(kpis.lastScan)} />
       </div>
 
-      {statusBreakdown.length > 0 ? (
+      {!hasAnyData && (
+        <EmptyState
+          icon={Folder}
+          title="No folder scanned yet"
+          description="Choose a folder above and click Scan folder to analyze your files. Everything on this page is computed live from your scan — nothing here is a placeholder."
+        />
+      )}
+
+      {hasAnyData && statusBreakdown.some(s => s.value > 0) && (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
           <SectionCard title="Files by status" className="lg:col-span-1">
             <div className="flex items-center gap-4">
@@ -213,7 +223,6 @@ export default function Overview() {
                         <Cell key={s.label} fill={STATUS_META[s.label]?.color || '#6B7280'} />
                       ))}
                     </Pie>
-                    <Tooltip formatter={(v, n) => [v, STATUS_META[n]?.label || n]} />
                   </PieChart>
                 </ResponsiveContainer>
               </div>
@@ -231,72 +240,51 @@ export default function Overview() {
             </div>
           </SectionCard>
 
-          <SectionCard title="Storage reclaimed over time" className="lg:col-span-2">
-            <div className="h-44">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={storageTrend} margin={{ left: -20, right: 10 }}>
-                  <defs>
-                    <linearGradient id="reclaim" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#2563EB" stopOpacity={0.35} />
-                      <stop offset="100%" stopColor="#2563EB" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />
-                  <XAxis dataKey="day" tick={{ fontSize: 11, fill: '#94A3B8' }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} axisLine={false} tickLine={false} />
-                  <Tooltip formatter={(v) => [`${v} GB`, 'Reclaimed']} />
-                  <Area type="monotone" dataKey="reclaimedGb" stroke="#2563EB" strokeWidth={2} fill="url(#reclaim)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
+          <SectionCard title="Biggest space wasters" className="lg:col-span-2">
+            {biggestWasters.length > 0 ? (
+              <ul className="space-y-3">
+                {biggestWasters.map(w => (
+                  <li key={w.name} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">{w.name}</p>
+                      <p className="text-xs text-slate-400">{w.type}</p>
+                    </div>
+                    <span className="shrink-0 text-sm font-semibold text-slate-600 dark:text-slate-300">{formatSize(w.sizeMb)}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="py-4 text-center text-sm text-slate-400">No file size data available.</p>
+            )}
           </SectionCard>
         </div>
-      ) : null}
+      )}
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        {biggestWasters.length > 0 ? (
-          <SectionCard title="Biggest space wasters" className="lg:col-span-1">
-            <ul className="space-y-3">
-              {biggestWasters.map(w => (
-                <li key={w.name} className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">{w.name}</p>
-                    <p className="text-xs text-slate-400">{w.type}</p>
-                  </div>
-                  <span className="shrink-0 text-sm font-semibold text-slate-600 dark:text-slate-300">{formatSize(w.sizeMb)}</span>
-                </li>
-              ))}
-            </ul>
-          </SectionCard>
-        ) : null}
-
-        {reviewItems.length > 0 ? (
-          <SectionCard
-            title="Needs your attention"
-            className="lg:col-span-2"
-            action={
-              <Link to="/review" className="focus-ring inline-flex items-center gap-1 text-sm font-medium text-brand-600 hover:underline dark:text-brand-400">
-                View all <ArrowRight className="h-3.5 w-3.5" />
-              </Link>
-            }
-          >
-            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-              {reviewItems.map(f => (
-                <li key={f.file_id} className="flex items-center justify-between gap-3 py-2.5">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">{f.name}</p>
-                    <p className="truncate font-mono text-xs text-slate-400">{f.folder}</p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <StatusBadge label={f.label} />
-                    <WhyExplain file={f} align="right" />
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </SectionCard>
-        ) : null}
-      </div>
+      {reviewItems.length > 0 && (
+        <SectionCard
+          title="Needs your attention"
+          action={
+            <Link to="/review" className="focus-ring inline-flex items-center gap-1 text-sm font-medium text-brand-600 hover:underline dark:text-brand-400">
+              View all <ArrowRight className="h-3.5 w-3.5" />
+            </Link>
+          }
+        >
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+            {reviewItems.map(f => (
+              <li key={f.file_id} className="flex items-center justify-between gap-3 py-2.5">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">{f.name}</p>
+                  <p className="truncate font-mono text-xs text-slate-400">{f.folder}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <StatusBadge label={f.label} />
+                  <WhyExplain file={f} align="right" />
+                </div>
+              </li>
+            ))}
+          </ul>
+        </SectionCard>
+      )}
     </div>
   )
 }

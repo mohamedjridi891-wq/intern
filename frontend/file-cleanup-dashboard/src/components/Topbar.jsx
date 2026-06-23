@@ -1,16 +1,8 @@
-import { useState } from 'react'
 import { Search, Bell, Moon, Sun, Sparkles } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
-export default function Topbar({ dark, setDark, collapsed }) {
-  const [notifOpen, setNotifOpen] = useState(false)
+export default function Topbar({ dark, setDark, collapsed, pendingCount = 0 }) {
   const navigate = useNavigate()
-
-  const notifications = [
-    { id: 1, text: 'Scan complete — 4,512 files analyzed', time: '2m ago' },
-    { id: 2, text: '18 items need review', time: '1h ago' },
-    { id: 3, text: '3 new duplicate clusters found', time: 'Yesterday' },
-  ]
 
   return (
     <header
@@ -36,27 +28,19 @@ export default function Topbar({ dark, setDark, collapsed }) {
       </button>
 
       <div className="ml-auto flex items-center gap-1.5 md:ml-3">
-        <div className="relative">
-          <button
-            onClick={() => setNotifOpen(o => !o)}
-            className="focus-ring relative rounded-xl p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-            aria-label="Notifications"
-          >
-            <Bell className="h-5 w-5" />
-            <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-brand-600 ring-2 ring-white dark:ring-navy-950" />
-          </button>
-          {notifOpen && (
-            <div className="animate-fadein absolute right-0 mt-2 w-72 rounded-2xl border border-slate-200 bg-white p-2 shadow-card dark:border-slate-700 dark:bg-navy-900">
-              <p className="px-2 py-1 text-xs font-semibold text-slate-400">Notifications</p>
-              {notifications.map(n => (
-                <div key={n.id} className="rounded-xl px-2 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">
-                  <p className="text-slate-700 dark:text-slate-200">{n.text}</p>
-                  <p className="text-xs text-slate-400">{n.time}</p>
-                </div>
-              ))}
-            </div>
+        <button
+          onClick={() => navigate('/review')}
+          className="focus-ring relative rounded-xl p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+          aria-label={pendingCount > 0 ? `${pendingCount} files pending review` : 'No files pending review'}
+          title={pendingCount > 0 ? `${pendingCount} file(s) pending review` : 'No files pending review'}
+        >
+          <Bell className="h-5 w-5" />
+          {pendingCount > 0 && (
+            <span className="absolute right-0.5 top-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-brand-600 px-1 text-[10px] font-semibold text-white ring-2 ring-white dark:ring-navy-950">
+              {pendingCount > 99 ? '99+' : pendingCount}
+            </span>
           )}
-        </div>
+        </button>
 
         <button
           onClick={() => setDark(d => !d)}
@@ -65,10 +49,6 @@ export default function Topbar({ dark, setDark, collapsed }) {
         >
           {dark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
         </button>
-
-        <div className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-brand-100 text-sm font-semibold text-brand-700 dark:bg-brand-900/50 dark:text-brand-300">
-          Y
-        </div>
       </div>
     </header>
   )

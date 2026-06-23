@@ -5,10 +5,6 @@ function explainFile(file) {
   const score = Number(file.importance_score) || 0
   const label = file.label || 'REVIEW'
 
-  // Prefer the real top-3 signals computed by ph9 (name + actual 0-1 value),
-  // ordered by SHAP magnitude. Fall back to sorting file.signals (raw SHAP
-  // magnitudes) only if the structured top_signal_* fields aren't present
-  // (e.g. Phase 9 hasn't run yet for this file).
   const structuredTop3 = [
     { signal: 'top_signal_1', label: file.top_signal_1, value: file.top_signal_1_value },
     { signal: 'top_signal_2', label: file.top_signal_2, value: file.top_signal_2_value },
@@ -26,8 +22,6 @@ function explainFile(file) {
       .map(([key, value]) => ({
         signal: key,
         label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-        // signals here are raw SHAP magnitudes, not 0-1 values — clamp so
-        // the bar never renders past 100% when no real signal value exists
         value: Math.min(1, value),
       }))
   }
@@ -39,10 +33,8 @@ function explainFile(file) {
   const tip = file.counterfactual_tip
     || `Use this explanation to decide whether the file should be kept, archived, or reviewed.`
 
-  // Use the model's real confidence (max class probability from ph9) when
-  // available; only fall back to a score-derived estimate before Phase 9
-  // has run for this file.
-  const confidence = file.confidence != null
+  const hasRealConfidence = file.confidence != null
+  const confidence = hasRealConfidence
     ? Number(file.confidence)
     : Math.min(1, Math.max(0.05, score / 100))
 
@@ -51,6 +43,7 @@ function explainFile(file) {
     top3: entries,
     tip,
     confidence,
+    hasRealConfidence,
   }
 }
 
@@ -115,7 +108,7 @@ export default function WhyExplain({ file, align = 'left' }) {
           </div>
 
           <div className="mt-3 flex items-center justify-between text-[11px] text-slate-400">
-            <span>Confidence {Math.round(ex.confidence * 100)}%</span>
+            <span>{ex.hasRealConfidence ? `Confidence ${Math.round(ex.confidence * 100)}%` : `Estimated confidence ${Math.round(ex.confidence * 100)}%`}</span>
             <span>You always make the final call.</span>
           </div>
         </div>

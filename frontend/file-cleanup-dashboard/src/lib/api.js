@@ -131,40 +131,52 @@ export async function performFileAction(fileId, action) {
 }
 
 /**
- * Compute KPIs from files data
+ * Compute KPIs from real files/reviewQueue/duplicates data.
+ * No fabricated numbers — every field here is derived directly from
+ * what the backend returned. If duplicates haven't been fetched yet,
+ * duplicatesFound is left at 0 honestly (because it IS zero in that
+ * render), not as a permanent stand-in for "we didn't bother wiring this up".
  */
-export function computeKPIs(files, reviewQueue) {
-  const now = new Date()
-  
+export function computeKPIs(files, reviewQueue, duplicates = []) {
   // Total files
   const totalFiles = files.length
-  
+
   // Storage metrics
   const totalSizeMb = files.reduce((sum, f) => sum + (f.size_bytes || 0), 0) / (1024 * 1024)
   const storageUsedGb = Math.round(totalSizeMb / 1024 * 10) / 10
-  
+
   // Reclaimable storage (sum of DELETE_CANDIDATE files)
   const reclaimableBytes = reviewQueue
     .filter(f => f.label === 'DELETE_CANDIDATE')
     .reduce((sum, f) => sum + (f.size_bytes || 0), 0)
   const storageReclaimableGb = Math.round((reclaimableBytes / (1024 ** 3)) * 10) / 10
-  
+
   // Pending review count
   const pendingReview = reviewQueue.filter(f => ['REVIEW', 'DELETE_CANDIDATE'].includes(f.label)).length
-  
-  // Find duplicates (if file_redundancy data available)
-  const duplicatesFound = 0 // Would need separate endpoint for this
-  
-  // Last scan time
-  const lastScan = files.length > 0 ? now : new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
-  
+
+  // Real duplicate pair count from /duplicates (file_redundancy table)
+  const duplicatesFound = duplicates.length
+
+  // Last scan time: derive from the most recent modified_time we actually
+  // have on hand. This is the freshest real timestamp the backend gives us
+  // per file (there is no dedicated "last scan" timestamp exposed yet).
+  // If there's no data at all, report it honestly instead of guessing.
+  let lastScan = null
+  if (files.length > 0) {
+    const mostRecent = files.reduce((latest, f) => {
+      const t = f.modified_time ? new Date(f.modified_time).getTime() : 0
+      return t > latest ? t : latest
+    }, 0)
+    lastScan = mostRecent > 0 ? new Date(mostRecent) : null
+  }
+
   return {
     totalFiles,
     storageUsedGb,
     storageReclaimableGb,
     pendingReview,
     duplicatesFound,
-    lastScan,
+    lastScan, // null means "no data yet" — render this as "Never scanned"
   }
 }
 
@@ -183,7 +195,7 @@ export function computeStatusBreakdown(reviewQueue) {
  * Get biggest space wasters
  */
 export function getBiggestWasters(files, limit = 5) {
-  return files
+  return [...files]
     .sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0))
     .slice(0, limit)
     .map(f => ({
@@ -241,12 +253,33 @@ export const STATUS_META = {
 }
 
 /**
- * Generate mock storage trend (real backend doesn't track historical data yet)
+ * Export an array of file-like rows to a real downloadable CSV file.
+ * No fake data — this serializes whatever real records were passed in.
  */
-export function generateStorageTrend(storageUsedGb) {
-  const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-  return days.map((day, i) => ({
-    day,
-    reclaimedGb: Math.max(0, Math.floor(storageUsedGb * 0.3 * (i / 7))),
-  }))
+export function exportToCsv(filename, rows, columns) {
+  if (!rows || rows.length === 0) return false
+
+  const escape = (val) => {
+    if (val == null) return ''
+    const s = String(val)
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+    return s
+  }
+
+  const header = columns.map(c => escape(c.label)).join(',')
+  const lines = rows.map(row =>
+    columns.map(c => escape(typeof c.value === 'function' ? c.value(row) : row[c.key])).join(',')
+  )
+  const csv = [header, ...lines].join('\n')
+
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+  return true
 }

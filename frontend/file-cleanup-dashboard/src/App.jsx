@@ -37,7 +37,7 @@ export default function App() {
     <div className="min-h-screen">
       <Sidebar collapsed={collapsed} setCollapsed={setCollapsed} pendingCount={pendingCount} />
       <div className={`transition-all duration-200 ${collapsed ? 'md:pl-[72px]' : 'md:pl-64'}`}>
-        <Topbar dark={dark} setDark={setDark} collapsed={collapsed} />
+        <Topbar dark={dark} setDark={setDark} collapsed={collapsed} pendingCount={pendingCount} />
         <main className="px-4 py-6 pb-20 md:px-6 md:pb-6">
           <Routes>
             <Route path="/" element={<Overview />} />

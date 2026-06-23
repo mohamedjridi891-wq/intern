@@ -66,6 +66,21 @@ export default function ReviewQueue() {
   const remaining = queue.length - index
   const progressPct = queue.length ? Math.round((decided / queue.length) * 100) : 0
 
+  // Confidence comes from Phase 9 (file_explanations.confidence). If Phase 9
+  // hasn't run yet for this file, current.confidence is null/undefined —
+  // showing "0%" in that case would falsely claim the model has zero
+  // confidence, when really we just don't have a real number yet. Fall
+  // back to a score-derived estimate (same logic WhyExplain uses) and
+  // label it honestly.
+  let confidenceLabel = '—'
+  if (current) {
+    const hasRealConfidence = current.confidence != null
+    const confidenceValue = hasRealConfidence
+      ? Number(current.confidence)
+      : Math.min(1, Math.max(0.05, (Number(current.importance_score) || 0) / 100))
+    confidenceLabel = `${Math.round(confidenceValue * 100)}%${hasRealConfidence ? '' : ' (est.)'}`
+  }
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
@@ -81,8 +96,11 @@ export default function ReviewQueue() {
         <div className="h-full rounded-full bg-brand-600 transition-all" style={{ width: `${progressPct}%` }} />
       </div>
 
-
-      {!current ? (
+      {loading ? (
+        <div className="rounded-2xl border border-slate-200 bg-white p-6 text-center text-sm text-slate-500 dark:border-slate-800 dark:bg-navy-900 dark:text-slate-400">
+          Loading review queue…
+        </div>
+      ) : !current ? (
         <EmptyState
           icon={PartyPopper}
           title="You're all caught up"
@@ -114,7 +132,7 @@ export default function ReviewQueue() {
             <div className="mt-4 grid grid-cols-3 gap-3 rounded-xl bg-slate-50 p-3 text-center text-xs dark:bg-navy-950/60">
               <div><p className="font-semibold text-slate-700 dark:text-slate-200">{formatSize(current.size_mb)}</p><p className="text-slate-400">Size</p></div>
               <div><p className="font-semibold text-slate-700 dark:text-slate-200">{formatDate(current.modified_time)}</p><p className="text-slate-400">Modified</p></div>
-              <div><p className="font-semibold text-slate-700 dark:text-slate-200">{Math.round((current.confidence || 0) * 100)}%</p><p className="text-slate-400">Confidence</p></div>
+              <div><p className="font-semibold text-slate-700 dark:text-slate-200">{confidenceLabel}</p><p className="text-slate-400">Confidence</p></div>
             </div>
 
             <div className="mt-4 flex items-center justify-between rounded-xl bg-brand-50 px-3 py-2.5 dark:bg-brand-900/20">

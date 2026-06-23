@@ -165,6 +165,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 TOP_K = int(os.getenv("PH13_TOP_K", 6))
 MAX_MESSAGE_CHARS = int(os.getenv("PH13_MAX_MESSAGE_CHARS", 2000))
+FILE_PREVIEW_CHARS = int(os.getenv("PH13_FILE_PREVIEW_CHARS", 320))
 
 ADVISORY_NOTICE = (
     "View only / Advisory assistant — I can search, explain, and recommend, "
@@ -670,6 +671,54 @@ def _explanations_join_sql(conn) -> tuple[str, str]:
     return "", ""
 
 
+def _real_text_preview(conn, file_id: int) -> str:
+    """
+    Return a real, truncated text preview for a single file — sourced from
+    the actual pipeline data (extracted_content.extracted_text, falling
+    back to the first successful chunk's clean_text). Returns "" if there
+    is genuinely no extracted text yet (e.g. extraction failed, or Phase 2
+    hasn't run), so the frontend can show an honest "no preview" state
+    instead of a templated fake sentence.
+    """
+    try:
+        if _table_exists(conn, 'extracted_content'):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT extracted_text, extraction_status
+                    FROM extracted_content
+                    WHERE file_id = %s
+                    """,
+                    (file_id,),
+                )
+                row = cur.fetchone()
+            if row and row.get("extraction_status") == "SUCCESS" and row.get("extracted_text"):
+                text = row["extracted_text"].strip()
+                if text:
+                    cleaned = _clean_context_text(text[:FILE_PREVIEW_CHARS * 4])
+                    return cleaned[:FILE_PREVIEW_CHARS].strip()
+
+        # Fallback: first successfully cleaned chunk for this file (ph3)
+        if _table_exists(conn, 'chunks'):
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT clean_text
+                    FROM chunks
+                    WHERE file_id = %s AND clean_status = 'SUCCESS' AND clean_text IS NOT NULL
+                    ORDER BY chunk_index ASC
+                    LIMIT 1
+                    """,
+                    (file_id,),
+                )
+                row = cur.fetchone()
+            if row and row.get("clean_text"):
+                return row["clean_text"].strip()[:FILE_PREVIEW_CHARS]
+    except Exception as e:
+        log.warning(f"Could not build real preview for file_id={file_id}: {e}")
+    return ""
+
+
 @app.get("/files")
 def list_files(limit: int = 100):
     try:
@@ -744,7 +793,14 @@ def file_detail(file_id: int):
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(404, "file not found")
-                return dict(row, icon=_icon_for_category(row.get("category")))
+
+                # Real text preview sourced from the actual pipeline data.
+                # Empty string means genuinely no extracted text exists —
+                # the frontend must render an honest "no preview" state,
+                # not a fabricated sentence.
+                preview = _real_text_preview(conn, file_id)
+
+                return dict(row, icon=_icon_for_category(row.get("category")), preview=preview)
     except HTTPException:
         raise
     except Exception as e:
@@ -920,12 +976,12 @@ def files_action(file_id: int, payload: dict):
                     (str(file_id), action, user),
                 )
 
+            predicted_label = None
+            predicted_score = None
             if new_label is not None:
                 # Look up the AI's current label/score before overwriting it,
                 # so we can tell ph11 whether this was an APPROVE (human
                 # agreed) or a REJECT (human overrode the AI).
-                predicted_label = None
-                predicted_score = None
                 if _table_exists(conn, 'file_scores'):
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
                         cur.execute(
